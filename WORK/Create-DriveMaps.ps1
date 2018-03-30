@@ -5,19 +5,21 @@ This script is intended to create or modify a GPO with drive maps configured in 
 This script creates or modifies a GPO with drive maps configured in a matching Excel workbook.
 The Excel workbook needs to be configured as follows:
 - The worksheet holding the configuration needs to be named 'DriveMaps'
-- The first row is ignored and may therefor contain headings
+- The first row is ignored and may therefore contain headings
 - Starting from the second row the columns need to contain the following information:
     1. UNC path pointing to the share to map
     2. Drive letter
     3. Drive label (optional)
     4. Filter (optional, can either be a group name or a distinguished name pointing at an OU)
-.PARAMETER GPOname
+.PARAMETER GPName
 The value provided for this parameter will be used as the GPOs name.
-.PARAMETER domain
+.PARAMETER Domain
 The value provided for this parameter will be used as the target domain for the GPO.
 If no value is provided the current domain will be used as the target domain.
+.PARAMETER Replace
+This switch defines which action is used for drive maps, Update or Replace.
 .NOTES
-Version:    1.7.1
+Version:    1.8.2
 Author:     Mönks, Dominik
 .LINK
 https://msdn.microsoft.com/en-us/library/cc232619.aspx
@@ -26,9 +28,10 @@ https://msdn.microsoft.com/en-us/library/cc232618.aspx
 #>
 
 param([ValidateNotNullOrEmpty()]
-        [string]$GPOname,
+        [string]$GPName,
         [ValidateNotNullOrEmpty()]
-        [string]$domain = (Get-ADDomain).DistinguishedName.Replace(',DC=','.').TrimStart('DC='))
+        [string]$Domain = (Get-ADDomain).DistinguishedName.Replace(',DC=','.').TrimStart('DC='),
+        [bool]$Replace)
 
 #region:Custom functions for XML
 function docStart()
@@ -69,20 +72,20 @@ if (Test-Path "$PSScriptRoot\DriveMaps.xlsx")
     Write-Host 'Succeeded' -ForegroundColor Green
     # Check for existing GPO
     Write-Host 'Checking for existing GPO:'.PadRight($outputWidth) -NoNewline
-    if (($gpo = Get-GPO $GPOname -Server $domain -ErrorAction SilentlyContinue) -eq $null)
+    if (($gpo = Get-GPO $GPName -Server $Domain -ErrorAction SilentlyContinue) -eq $null)
     {
         Write-Host 'Failed' -ForegroundColor Yellow -NoNewline
         Write-Host ', creating GPO'
-        $gpo = New-GPO $GPOname -Server $domain
+        $gpo = New-GPO $GPName -Server $Domain
     }
 	else
     {
         Write-Host 'Succeeded' -ForegroundColor Green -NoNewline
         Write-Host ', backing up GPO'
-        Backup-GPO $GPOname -Server $domain -Path $PSScriptRoot -Comment $([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')) | Out-Null
+        Backup-GPO $GPName -Server $Domain -Path $PSScriptRoot -Comment $([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')) | Out-Null
     }
     # Check for configuration subfolder in GPO folder
-    $GPO_FOLDER = "\\$domain\SYSVOL\$domain\Policies\{$($gpo.Id)}"
+    $GPO_FOLDER = "\\$Domain\SYSVOL\$Domain\Policies\{$($gpo.Id)}"
     $DRIVES_FILE = "$GPO_FOLDER\User\Preferences\Drives\Drives.xml"
     Write-Host 'Checking for existing configuration:'.PadRight($outputWidth) -NoNewline
     if (-not (Test-Path (Split-Path $DRIVES_FILE)))
@@ -126,9 +129,9 @@ if (Test-Path "$PSScriptRoot\DriveMaps.xlsx")
     $INI_CONTENT = [Collections.Generic.List[string]]::new()
     $INI_CONTENT.Add('[General]')
     $INI_CONTENT.Add("Version=$version")
-    $INI_CONTENT.Add("displayName=$GPOname")
+    $INI_CONTENT.Add("displayName=$GPName")
     [IO.File]::WriteAllLines($INI_FILE, $INI_CONTENT, $encoding)
-    Get-ADObject -LDAPFilter "(&(objectClass=groupPolicyContainer)(name={$($gpo.Id)}))" -Server $domain | Set-ADObject -Replace @{gPCUserExtensionNames='[{00000000-0000-0000-0000-000000000000}{2EA1A81B-48E5-45E9-8BB7-A6E3AC170006}][{5794DAFD-BE60-433F-88A2-1A31939AC01F}{2EA1A81B-48E5-45E9-8BB7-A6E3AC170006}]';versionNumber="$version"}
+    Get-ADObject -LDAPFilter "(&(objectClass=groupPolicyContainer)(name={$($gpo.Id)}))" -Server $Domain | Set-ADObject -Replace @{gPCUserExtensionNames='[{00000000-0000-0000-0000-000000000000}{2EA1A81B-48E5-45E9-8BB7-A6E3AC170006}][{5794DAFD-BE60-433F-88A2-1A31939AC01F}{2EA1A81B-48E5-45E9-8BB7-A6E3AC170006}]';versionNumber="$version"}
     Write-Host 'Succeeded' -ForegroundColor Green
     # Create new configuration
     Write-Host 'Starting to write drive maps to configuration file...'
@@ -165,14 +168,31 @@ if (Test-Path "$PSScriptRoot\DriveMaps.xlsx")
                         att 'clsid' '{935D1B74-9CB8-4e3c-9914-7DD559B7A417}'
                         att 'name' "${letter}:"
                         att 'status' "${letter}:"
-                        att 'image' '1'
+                        if ($Replace)
+                        {
+                            att 'image' '1'
+                        }
+                        else
+                        {
+                            att 'image' '2'
+                        }
                         att 'changed' (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
                         att 'uid' "{$((New-Guid).ToString().ToUpper())}"
-                        att 'removePolicy' '1'
+                        if ($Replace)
+                        {
+                            att 'removePolicy' '1'
+                        }                        
                         att 'userContext' '1'
                         att 'bypassErrors' '1'
                         eleStart 'Properties'
-                            att 'action' 'R'
+                            if ($Replace)
+                            {
+                                att 'action' 'R'
+                            }
+                            else
+                            {
+                                att 'action' 'U'
+                            }
                             att 'thisDrive' 'SHOW'
                             att 'allDrives' 'NOCHANGE'
                             att 'path' $path
@@ -180,7 +200,14 @@ if (Test-Path "$PSScriptRoot\DriveMaps.xlsx")
                             {
                                 att 'label' $label
                             }
-                            att 'persistent' '1'
+                            if ($Replace)
+                            {
+                                att 'persistent' '1'
+                            }
+                            else
+                            {
+                                att 'persistent' '0'
+                            }
                             att 'useLetter' '1'
                             att 'letter' $letter
                         eleEnd
@@ -235,7 +262,7 @@ if (Test-Path "$PSScriptRoot\DriveMaps.xlsx")
     # Activate drive mappings in administrator context
     if (($gpo | Get-GPPrefRegistryValue -Context Computer -Key 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ValueName 'EnableLinkedConnections') -eq $null)
     {
-        $gpo | Set-GPPrefRegistryValue -Context Computer -Key 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ValueName 'EnableLinkedConnections' -Value 1 -Type DWord -Action Replace | Out-Null
+        $gpo | Set-GPPrefRegistryValue -Context Computer -Key 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ValueName 'EnableLinkedConnections' -Value 1 -Type DWord -Action Update | Out-Null
     }
     $gpo.Description = "Configuration file was last edited on $((Get-Item "$PSScriptRoot\DriveMaps.xlsx").LastWriteTime.ToString('yyyy-MM-dd'))."
 }

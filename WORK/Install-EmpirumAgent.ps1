@@ -17,19 +17,23 @@ If the local environment variable EmpirumServer is missing or empty the script w
 Provide the DHCP option number used to inform clients about the correct Empirum depot server in your infrastructure.
 .PARAMETER FallbackServer
 If the depot server configured in the local environment variable EmpirumServer is unavailable the script will use this fallback server instead.
-.PARAMETER WeeklyErrorThreshold
-If the amount of error-level entries in EventLog from 'Service Control Manager' naming the 'Empirum Remote Installation Service' as source exceeds this value a reinstallation will be invoked.
 .PARAMETER EmpAgentBatch
 If a (re-)installation of the server needs to invoked the script will run this batch file from '\\%EmpirumServer%\User\'.
 .PARAMETER EmpInventoryBatch
 If an inventory of the client needs to invoked the script will run this batch file from '\\%EmpirumServer%\User\'.
+.PARAMETER ErrorThreshold
+If the amount of Error-level entries in EventLog from 'Service Control Manager' naming the 'Empirum Remote Installation Service' as source exceeds this value a reinstallation will be invoked.
+.PARAMETER IntervalDays
+This interval is used for every check made by this script, e.g. the system's provisioning date, the service's error count, etc.
 .PARAMETER EmpAgentLog
 The script automatically writes debug information to this location.
 Provide a path to the desired log file if the default location is inacceptable.
+.PARAMETER WhatIf
+If the script would end up executing either of the files set by EmpInventoryBatch or EmpAgentBatch this switch just logs this result without execution.
 .EXAMPLE
-EmpAgent.ps1 -DHCPOptionNumber 128 -FallbackServer 'EmpirumMaster' -WeeklyErrorThreshold 10 -EmpAgentBatch 'EmpirumAgent.bat' -EmpInventoryBatch 'EmpirumInventory.bat'
+EmpAgent.ps1 -DHCPOptionNumber 128 -FallbackServer 'EmpirumMaster' -EmpAgentBatch 'EmpirumAgent.bat' -EmpInventoryBatch 'EmpirumInventory.bat' -ErrorThreshold 10
 .NOTES
-Version:    2.2.7
+Version:    2.3.1
 Author:     Mönks, Dominik
 
 Parts of this script are based on Chris Dent's article 'DHCP Discovery' available at http://www.indented.co.uk/2010/02/17/dhcp-discovery/.
@@ -48,17 +52,17 @@ param([Parameter(Mandatory=$true)]
         [string]$FallbackServer,
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [int]$WeeklyErrorThreshold,
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
         [string]$EmpAgentBatch,
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
         [string]$EmpInventoryBatch,
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [int]$ErrorThreshold,
+        [int]$IntervalDays=7,
         [string]$EmpAgentLog='C:\EmpAgent.log',
         [switch]$WhatIf)
 
-#region:Functions
 function New-DHCPINFORM([int[]]$optioncodes)
 {
     $netconf = (Get-WmiObject -Query 'SELECT IPAddress, MACAddress FROM Win32_NetworkAdapterConfiguration WHERE DHCPServer IS NOT NULL')
@@ -153,76 +157,108 @@ function Write-Log([string]$Message, [System.ConsoleColor]$Color = [System.Conso
         [System.IO.File]::AppendAllText($EmpAgentLog, $Message + [System.Environment]::NewLine)
     }
 }
-#endregion
 
 $outputWidth = 100
 
-# Was the script run recently?
-$runDate = (Get-ChildItem (Split-Path $EmpAgentLog -Parent) -Filter (((Split-Path $EmpAgentLog -Leaf).Split('.') | Select-Object -First 1 -Last 1) -join '*.') | Sort-Object -Property 'LastWriteTime' -Descending | Select-Object -First 1).LastWriteTime
-if ($runDate -lt [datetime]::Now.AddDays(-1))
+# Check if the script was run in an administrative context.
+if (([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator))
 {
+    # Collect previous log files.
+    $logFiles = Get-ChildItem (Split-Path $EmpAgentLog -Parent) -Filter (((Split-Path $EmpAgentLog -Leaf).Split('.') | Select-Object -First 1 -Last 1) -join '*.')
     # Remove all but the last 5 log files.
-    Get-ChildItem (Split-Path $EmpAgentLog -Parent) -Filter (((Split-Path $EmpAgentLog -Leaf).Split('.') | Select-Object -First 1 -Last 1) -join '*.') | Sort-Object -Property 'LastWriteTime' -Descending | Select-Object -Skip 5 | Remove-Item -Force
+    $logFiles | Sort-Object -Property 'LastWriteTime' -Descending | Select-Object -Skip 5 | Remove-Item -Force
     # Create actual log file name from given file name.
     $EmpAgentLog = [regex]::Replace($EmpAgentLog, '\w+$', "$([datetime]::Now.ToString('yyyyMMddHHmmss')).$&")
     # Was the operating system installed recently?
-    $installDate = [System.Management.ManagementDateTimeConverter]::ToDateTime((Get-WmiObject 'Win32_OperatingSystem').InstallDate)
     Write-Log -Message 'Checking if system was provisioned recently:'.PadRight($outputWidth) -NoNewLine
-    if ($installDate -lt [datetime]::Now.AddDays(-1))
+    if (($installDate = [System.Management.ManagementDateTimeConverter]::ToDateTime((Get-WmiObject 'Win32_OperatingSystem').InstallDate)) -lt [datetime]::Now.AddDays(-$IntervalDays))
     {
-        Write-Log -Message 'Succeeded' -Color Green -NoNewLine
-        Write-Log -Message ", system was provisioned on $($installDate.ToShortDateString())"
+        Write-Log -Message 'Succeeded' -Color Green
         # Is the service installed?
         Write-Log -Message 'Checking for ERIS service:'.PadRight($outputWidth) -NoNewLine
         if ((Get-Service ERIS -ErrorAction SilentlyContinue) -ne $null)
         {
             Write-Log -Message 'Succeeded' -Color Green
-            Write-Log -Message 'Checking service health:'.PadRight($outputWidth) -NoNewline
-            # Is the service disabled?
-            if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS').Start -eq 4)
+            # Was the script run recently?
+            Write-Log -Message 'Checking if script was run recently:'.PadRight($outputWidth) -NoNewline
+            if ($logFiles.Count -gt 1)
             {
-                Write-Log -Message 'Failed' -Color Yellow -NoNewline
-                Write-Log ', service is disabled'
-                Write-EventLog -LogName Application -Source 'Application' -EntryType Warning -EventId 10002 -Category 4 -Message 'ERIS service has warnings, service is disabled'
-                Remove-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name DelayedAutostart
-                $install = $false
-            }
-            else
-            {
-                # Make sure the service is configured for delayed automatic start
-                Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name Start -Value 2 -Type DWORD
-                Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name DelayedAutostart -Value 1 -Type DWORD
-                # Does the service's error count exceed the threshold?
-                if (($ErrorCount = (Get-EventLog -LogName System -EntryType Error -Source 'Service Control Manager' -Message '*Empirum Remote Installation Service*' -After ([datetime]::Now.AddDays(-7)) -ErrorAction SilentlyContinue).Count) -gt $WeeklyErrorThreshold)
+                # Calculate intervals
+                $intervals = New-Object 'System.Collections.Generic.List[long]'
+                for ($i = 1; $i -lt $logFiles.Count; $i++)
                 {
-                    Write-Log -Message 'Failed' -Color Red -NoNewline
-                    Write-Log ", initiating reinstallation (EventLog errors: $ErrorCount/$WeeklyErrorThreshold)"
-                    Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
-                    $install = $true
+                    $intervals.Add(($logFiles[$i].LastWriteTime - $logFiles[$i - 1].LastWriteTime).Ticks)
                 }
-                # Does the agent config contain settings?
-                elseif ((Get-Item "$env:SystemRoot\System32\Empirum\AgentConfig.xml" -ErrorAction SilentlyContinue).Length -eq 0)
+                $intervals = $intervals | Sort-Object
+                # Calculate the median interval
+                if ($intervals.Count % 2 -eq 0)
                 {
-                    Write-Log -Message 'Failed' -Color Red -NoNewline
-                    Write-Log ', initiating reinstallation (AgentConfig.xml empty or missing)'
-                    Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
-                    $install = $true
-                }
-                # Is the service's log up-to-date?
-                elseif ((Get-Item "$env:SystemRoot\System32\Empirum\ERIS.log" -ErrorAction SilentlyContinue).LastWriteTime -lt [System.Management.ManagementDateTimeConverter]::ToDateTime((Get-WmiObject 'Win32_OperatingSystem').LastBootUpTime).AddDays(-1))
-                {
-                    Write-Log -Message 'Failed' -Color Red -NoNewline
-                    Write-Log ', initiating reinstallation (ERIS.log outdated)'
-                    Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
-                    $install = $true
+                    $median = ($intervals[$intervals.Count / 2 - 1] + $intervals[$intervals.Count / 2]) / 2
                 }
                 else
                 {
-                    Write-Log -Message 'Succeeded' -Color Green -NoNewLine
-                    Write-Log -Message " (EventLog errors: $ErrorCount/$WeeklyErrorThreshold)"
-                    Write-EventLog -LogName Application -Source 'Application' -EntryType Information -EventId 10001 -Category 4 -Message 'ERIS service is configured correctly'
+                    $median = $intervals[($intervals.Count - 1) / 2]
+                }
+                # Calculate the average interval
+                $average = 0
+                $intervals | ForEach-Object{$average += $_}
+                $average = $average / $intervals.Count
+            }
+            if (($median -le $average) -or (($logFiles | Select-Object -First 1).LastWriteTime -le [datetime]::Now.AddDays(-$IntervalDays)))
+            {
+                Write-Log -Message 'Succeeded' -Color Green
+                Write-Log -Message 'Checking service health:'.PadRight($outputWidth) -NoNewline
+                # Is the service disabled?
+                if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS').Start -eq 4)
+                {
+                    Write-Log -Message 'Failed' -Color Yellow -NoNewline
+                    Write-Log ', service is disabled'
+                    Write-EventLog -LogName Application -Source 'Application' -EntryType Warning -EventId 10002 -Category 4 -Message 'ERIS service has warnings, service is disabled'
+                    Remove-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name DelayedAutostart
                     $install = $false
                 }
+                else
+                {
+                    # Make sure the service is configured for delayed automatic start
+                    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name Start -Value 2 -Type DWORD
+                    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\ERIS' -Name DelayedAutostart -Value 1 -Type DWORD
+                    # Does the service's error count exceed the threshold?
+                    if (($ErrorCount = @(Get-EventLog -LogName System -EntryType Error -Source 'Service Control Manager' -Message '*Empirum Remote Installation Service*' -After ([datetime]::Now.AddDays(-$IntervalDays)) -ErrorAction SilentlyContinue).Count) -gt $ErrorThreshold)
+                    {
+                        Write-Log -Message 'Failed' -Color Red -NoNewline
+                        Write-Log ", initiating reinstallation (EventLog errors: $ErrorCount/$ErrorThreshold)"
+                        Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
+                        $install = $true
+                    }
+                    # Does the agent config contain settings?
+                    elseif ((Get-Item "$env:SystemRoot\System32\Empirum\AgentConfig.xml" -ErrorAction SilentlyContinue).Length -lt 1024)
+                    {
+                        Write-Log -Message 'Failed' -Color Red -NoNewline
+                        Write-Log ', initiating reinstallation (AgentConfig.xml empty or missing)'
+                        Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
+                        $install = $true
+                    }
+                    # Is the service's log up-to-date?
+                    elseif ((Get-Item "$env:SystemRoot\System32\Empirum\ERIS.log" -ErrorAction SilentlyContinue).LastWriteTime -lt [System.Management.ManagementDateTimeConverter]::ToDateTime((Get-WmiObject 'Win32_OperatingSystem').LastBootUpTime).AddDays(-$IntervalDays))
+                    {
+                        Write-Log -Message 'Failed' -Color Red -NoNewline
+                        Write-Log ', initiating reinstallation (ERIS.log outdated)'
+                        Write-EventLog -LogName Application -Source 'Application' -EntryType Error -EventId 10003 -Category 4 -Message 'ERIS service has errors, initiating reinstallation...'
+                        $install = $true
+                    }
+                    else
+                    {
+                        Write-Log -Message 'Succeeded' -Color Green -NoNewLine
+                        Write-Log -Message " (EventLog errors: $ErrorCount/$ErrorThreshold)"
+                        Write-EventLog -LogName Application -Source 'Application' -EntryType Information -EventId 10001 -Category 4 -Message 'ERIS service is configured correctly'
+                        $install = $false
+                    }
+                }
+            }
+            else
+            {
+                Write-Log -Message 'Failed' -Color Yellow -NoNewline
+                Write-Log ", script was last run on $(($logFiles | Sort-Object -Property 'LastWriteTime' -Descending | Select-Object -First 1).LastWriteTime.ToString('yyyy%-MM%-dd'))"
             }
         }
         else
@@ -414,7 +450,7 @@ if ($runDate -lt [datetime]::Now.AddDays(-1))
                         }
                         else
                         {
-                            Write-Log -Message 'Failed' -Color Red
+                            Write-Log -Message 'Failed' -Color Red -NoNewLine
                             Write-Log -Message ", couldn't find file $EmpInventoryBatch"
                         }
                     }
@@ -432,7 +468,11 @@ if ($runDate -lt [datetime]::Now.AddDays(-1))
     }
     else
     {
-        Write-Log -Message 'Failed' -Color Yellow -NoNewline
-        Write-Log -Message ', system was provisioned recently'
+        Write-Log -Message 'Failed' -Color Red -NoNewLine
+        Write-Log -Message ", system was provisioned on $($installDate.ToString('yyyy%-MM%-dd'))"
     }
+}
+else
+{
+    Write-Host 'The script was run without administrative rights. Please try again.'
 }
